@@ -89,6 +89,10 @@ class Durak:
         self.winner = None
 
     @property
+    def get_n_cards(self):
+        return len(self.deck)
+
+    @property
     def attacking_cards(self):
         """
         List of attacking cards
@@ -205,11 +209,16 @@ class Durak:
         assert not self.winner
 
         took_cards = False
-        if self.attack_succeed:
+        if self.attack_succeed and self.opponent_player.cards:
             print('there is some unbeaten card')
             # take all cards from the field if player couldn't defend
             self._take_all_field()
             took_cards = True
+        elif self.deck and not self.opponent_player.cards:
+            for key, value in self.field.items():
+                if value is None:
+                    self.current_player.take_card(key)
+            self.field = {}
         else:
             # all cards are beaten, so just clearing the field
             self.field = {}

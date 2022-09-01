@@ -1,15 +1,17 @@
 import logging
+import os
 from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, \
-    ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from durak_interface import DurakInterface
 from aiogram.utils.callback_data import CallbackData
 from sqlalchemy import create_engine, Table, Column, Integer, String, MetaData
 from cards import Durak, DECK
+from database import UsersDatabase, PartnersDatabase
 
 meta = MetaData()
-
 logging.basicConfig(level=logging.INFO)
-TOKEN = '5673734280:AAG6MskGNKJaqdugAKspyjEc9lZsUCqcmM0'
+
+TOKEN = os.getenv('TOKEN')
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot=bot)
 connect_cb = CallbackData('connect', 'action', 'chat_id', 'username')
@@ -28,103 +30,73 @@ partners = Table(
 conn = engine.connect()
 meta.create_all(engine)
 
+users_db = UsersDatabase(connection=conn, table=users)
+partners_db = PartnersDatabase(connection=conn, table=partners)
+
+durak_interface = DurakInterface(bot=bot, partners_db=partners_db, users_db=users_db)
+
 
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
-    q = users.select().where(users.c.chat_id == message.chat.id)
-    result = conn.execute(q)
+    result = users_db.select_by_id(message.chat.id)
     if result.first() is None:
-        ins = users.insert().values(username=message.chat.username, chat_id=message.chat.id)
-        result = conn.execute(ins)
-        print(result)
-    await message.answer('Hello, ready to play some games? Click /play!')
+        users_db.insert(message.chat.username, chat_id=message.chat.id)
+    await message.answer('Привет, ты готов играть? Тогда смело отправляй мне /play!')
 
 
 async def get_users(message: types.Message):
-    u = users.select()
-    result = conn.execute(u)
+    result = users_db.select_all()
     keyboard = InlineKeyboardMarkup()
     for row in result:
         if message.chat.username == row[1]:
             continue
-        s = users.select().where(users.c.username == row[1])
-        chat_id = conn.execute(s).first()[2]
+        result = users_db.select_by_username(row[1])
+        chat_id = result.first()[2]
         keyboard.add(InlineKeyboardButton(text=row[1], callback_data=connect_cb.new(action='request', chat_id=chat_id,
                                                                                     username=row[1])))
-    await message.answer(f'All users:', reply_markup=keyboard)
-
-
-# checking if row exists in table, particularly partners or users
-def exists_in_table(conn, table, chat_id):
-    q = table.select().where(table.c.chat_id == chat_id)
-    result = conn.execute(q)
-    if result.first() is None:
-        return False
-    else:
-        return True
-
-
-def get_partner(message):
-    q = partners.select().where(partners.c.chat_id == message.chat.id)
-    result = conn.execute(q)
-    return result
+    await message.answer(f'Все пользователи:', reply_markup=keyboard)
 
 
 # creating a pull of players to choose
 @dp.message_handler(commands=['play'])
 async def play(message: types.Message):
-    await message.answer("That's great, now choose user, which with you'd like to play:")
+    await message.answer("Замечательно, теперь выбери пользователя, с котором ты бы хотел поиграть:")
     await get_users(message)
-
-messages = {}
-
-
-# async def create_or_edit_field(durak, chat_id=None, message: types.Message = None):
-#     text = ''
-#     for attacking_cards, defending_cards in durak.field.items():
-#         if defending_cards is None:
-#             text += f'{attacking_cards}'
-#         text += f'{attacking_cards}/{defending_cards}\t'
-#     try:
-#         await message.edit_text(text)
-#     except Exception:
-#         msg = await bot.send_message(text, chat_id)
-#         messages[chat_id] = msg
 
 
 # deleting a session between users
 @dp.message_handler(commands=['quit'])
 async def quit_dialog(message: types.Message):
     try:
-        if exists_in_table(conn, partners, message.chat.id):
-            q = partners.select().where(partners.c.chat_id == message.chat.id)
-            result = conn.execute(q)
+        if partners_db.exists_in_table(message.chat.id):
+            result = partners_db.select_by_id(chat_id=message.chat.id)
             row = result.first()
-            print(row)
+
             durak_games.pop(str(row[1]), None)
             durak_games.pop(str(message.chat.id), None)
+            durak_interface.delete_message(str(message.chat.id))
+            durak_interface.delete_message(str(row[1]))
+
             await bot.send_message(row[1],
-                                   'The connection was cut off by other user. Hope you had a good time',
+                                   'Соединение было разорвано другим пользователем. Надеюсь ты хорошо провел время',
                                    reply_markup=ReplyKeyboardRemove())
         else:
             raise Exception
-        await message.answer('Hope you had good time', reply_markup=ReplyKeyboardRemove())
-        delete_q1 = partners.delete().where(partners.c.chat_id == message.chat.id)
-        delete_q2 = partners.delete().where(partners.c.chat_id == row[1])
-        conn.execute(delete_q1)
-        conn.execute(delete_q2)
+        await message.answer('Надеюсь ты хорошо провел время', reply_markup=ReplyKeyboardRemove())
+        partners_db.delete_by_id(message.chat.id)
+        partners_db.delete_by_id(row[1])
     except Exception:
-        await message.answer("You don't have any partners yet. Send me /play and I'll find you somebody to play with:)")
+        await message.answer("У тебя нету партнеров пока что. Отправь мне /play и я найду с кем тебе поиграть:)")
 
 
 # requesting chosen user to create a connection
 @dp.callback_query_handler(connect_cb.filter(action='request'))
 async def request_to_connect(callback_query: types.CallbackQuery, callback_data: dict):
-    if exists_in_table(conn, partners, callback_query.message.chat.id):
-        await callback_query.answer('You already have one connection and you cannot create a new one. '
-                                    'Send me /quit if you want to terminate this one.')
+    if partners_db.exists_in_table(callback_query.message.chat.id):
+        await callback_query.answer('У тебя уже есть одно соединение и поэтому не можешь создать еще одно. '
+                                    'Отправь мне /quit если хочешь разоровать это.')
     else:
-        await callback_query.answer('Request is sent. Waiting for response...')
+        await callback_query.answer('Запрос отправлен. Ожидание ответа...')
         keyboard = InlineKeyboardMarkup(row_width=2)
         keyboard.add(InlineKeyboardButton('Yes', callback_data=connect_cb.new(action='accepted',
                                                                               chat_id=callback_query.message.chat.id,
@@ -133,28 +105,9 @@ async def request_to_connect(callback_query: types.CallbackQuery, callback_data:
                                                                              chat_id=callback_query.message.chat.id,
                                                                              username=callback_query.message.chat.username)))
         await bot.send_message(callback_data['chat_id'],
-                               f"There is request from {callback_query.message.chat.username}. "
-                               f"Do you want to play with him/her? ",
+                               f"Есть запрос от {callback_query.message.chat.username}. "
+                               f"Хочешь ли ты поиграть с ним/ней? ",
                                reply_markup=keyboard)
-
-
-def get_card_hand_kb(cards_list, player_index, turn):
-    buttons = [[]]
-    list_index = 0
-    counter = 0
-    for rank, suit in cards_list:
-        buttons[list_index].append(KeyboardButton(f'{rank} {suit}'))
-        counter += 1
-        if counter % 6 == 0:
-            buttons.append([])
-            list_index += 1
-    if player_index == turn:
-        buttons.append([KeyboardButton('Отбой')])
-    else:
-        buttons.append([KeyboardButton('Забрать карты')])
-    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
-    return kb
 
 
 durak_games = dict()
@@ -163,136 +116,114 @@ durak_games = dict()
 # accepting request and establishing connection. Adding users to database 'partners'
 @dp.callback_query_handler(connect_cb.filter(action='accepted'))
 async def request_accepted(callback_query: types.CallbackQuery, callback_data: dict):
-    if exists_in_table(conn, partners, callback_query.message.chat.id):
-        await callback_query.answer('You already have one connection and you cannot create a new one. '
-                                    'Send me /quit if you want to terminate this one.')
+    if partners_db.exists_in_table(callback_query.message.chat.id):
+        await callback_query.answer('У тебя уже есть одно соединение и поэтому не можешь создать еще одно. '
+                                    'Отправь мне /quit если хочешь разоровать это.')
     else:
-        ins_1 = partners.insert().values(chat_id=callback_query.message.chat.id,
-                                         partner_chat_id=callback_data['chat_id'])
-        ins_2 = partners.insert().values(chat_id=callback_data['chat_id'],
-                                         partner_chat_id=callback_query.message.chat.id)
-        conn.execute(ins_1)
-        conn.execute(ins_2)
+        partners_db.insert(callback_query.message.chat.id, callback_data['chat_id'])
+        partners_db.insert(callback_data['chat_id'], callback_query.message.chat.id)
+
         durak = durak_games[str(callback_query.message.chat.id)] = Durak(callback_query.message.chat.id)
         durak_games[str(callback_data['chat_id'])] = durak
         durak.current_player.chat_id = callback_query.message.chat.id
         durak.opponent_player.chat_id = callback_data['chat_id']
-        kb_1 = get_card_hand_kb(durak.current_player.cards, durak.current_player.index, durak.attacker_index)
-        kb_2 = get_card_hand_kb(durak.opponent_player.cards, durak.opponent_player.index, durak.attacker_index)
-        await callback_query.message.answer('The game is started!GL HF', reply_markup=kb_1)
-        await callback_query.message.answer(f'The trump is {durak.trump}.')
+
+        kb_1 = durak_interface.get_card_hand_kb(durak.current_player.cards,
+                                                durak.current_player.index, durak.attacker_index)
+        kb_2 = durak_interface.get_card_hand_kb(durak.opponent_player.cards,
+                                                durak.opponent_player.index, durak.attacker_index)
+
+        await callback_query.message.answer('Игра началась!GL HF', reply_markup=kb_1)
+        await durak_interface.create_or_edit_field(durak, callback_query.message.chat.id)
         await bot.send_message(callback_data['chat_id'],
-                               'Your request was accepted. The game is started! GL HF', reply_markup=kb_2)
-        await bot.send_message(callback_data['chat_id'],
-                               f'The trump is {durak.trump}.')
+                               'Твой запрос был принят. Игра началась! GL HF', reply_markup=kb_2)
+        await durak_interface.create_or_edit_field(durak, callback_data['chat_id'])
 
 
 # rejecting a request
 @dp.callback_query_handler(connect_cb.filter(action='rejected'))
 async def request_rejected(callback_query: types.CallbackQuery, callback_data: dict):
-    await callback_query.message.answer('Request is rejected')
+    await callback_query.message.answer('Запрос отклонен.')
     await bot.send_message(callback_data['chat_id'],
-                           "Your request was unfortunately rejected. I am sure you'll find someone else")
+                           "Твой запрос был, к сожалению, отклонен. Я уверен ты найдешь еще кого-нибудь")
     await get_users(callback_query.message)
 
 
 @dp.message_handler(lambda msg: msg.text == 'Отбой')
-async def attacker_finish(message: types.Message):
-    result = get_partner(message)
+async def attacker_finish(message: types.Message, is_game_over=False):
+    result = partners_db.select_by_id(message.chat.id)
     partner_chat_id = result.fetchone()[1]
     durak = durak_games[str(message.chat.id)]
-    response = durak.finish_turn()
-    if durak.attack_succeed and response != 'game_over':
-        await message.answer('Not all your cards is beaten yet')
+    if durak.attack_succeed and not is_game_over:
+        await message.answer('Не все карты еще побиты.')
     else:
+        response = durak.finish_turn()
         if response == 'normal':
-            durak.attacker_chat_id = partner_chat_id
-            await message.answer('The round is over')
-            await message.answer('The opponent player is now going to play. You defend.',
-                                 reply_markup=get_card_hand_kb(durak.opponent_player.cards,
-                                                               durak.opponent_player.index,
-                                                               durak.attacker_index))
-            await bot.send_message(text='The round is over', chat_id=partner_chat_id)
-            await bot.send_message(text='You have beaten all the cards. It is your turn to attack!',
-                                   chat_id=partner_chat_id,
-                                   reply_markup=get_card_hand_kb(durak.current_player.cards,
-                                                                 durak.current_player.index,
-                                                                 durak.attacker_index))
+            await durak_interface.normal_finish(durak, message.chat.id, partner_chat_id)
         elif response == 'game_over':
-            await message.answer('You have won!!! Congrats!', reply_markup=ReplyKeyboardRemove())
-            await bot.send_message(partner_chat_id, 'You lose. You are DURAK.', reply_markup=ReplyKeyboardRemove())
+            await message.answer('Ты победил!!! Поздравляю!', reply_markup=ReplyKeyboardRemove())
+            await bot.send_message(partner_chat_id, 'Ты проирал. Ты ДУРАК.', reply_markup=ReplyKeyboardRemove())
             await quit_dialog(message)
 
 
 @dp.message_handler(lambda msg: msg.text == 'Забрать карты')
 async def defender_finish(message: types.Message):
-    result = get_partner(message)
+    result = partners_db.select_by_id(message.chat.id)
     partner_chat_id = result.fetchone()[1]
     durak = durak_games[str(message.chat.id)]
     if not durak.attack_succeed:
-        await message.answer('You have beaten all the cards for now. You do not need to take any card')
+        await message.answer('Ты побил пока все карты. Тебе не нужно ничего забирать')
     else:
-        print(durak.field)
         response = durak.finish_turn()
-        print(response, 'response')
         if response == 'took_cards':
-            await message.answer('You have just taken all the cards from the field. You are going to defend again.',
-                                 reply_markup=get_card_hand_kb(durak.opponent_player.cards,
-                                                               durak.opponent_player.index,
-                                                               durak.attacker_index)
-                                 )
-            await bot.send_message(partner_chat_id, 'Opponent player took all of the cards. You can attack again!',
-                                   reply_markup=get_card_hand_kb(durak.current_player.cards,
-                                                                 durak.current_player.index,
-                                                                 durak.attacker_index))
+            await durak_interface.took_cards_finish(durak, message.chat.id, partner_chat_id)
         elif response == 'game_over':
-            await message.answer('You have won!!! Congrats!', reply_markup=ReplyKeyboardRemove())
-            await bot.send_message(partner_chat_id, 'You lose. You are DURAK.', reply_markup=ReplyKeyboardRemove())
+            await message.answer('Ты победил!!! Поздравляю!', reply_markup=ReplyKeyboardRemove())
+            await bot.send_message(partner_chat_id, 'Ты проирал. Ты ДУРАК.', reply_markup=ReplyKeyboardRemove())
             await quit_dialog(message)
 
 
 @dp.message_handler(lambda msg: (msg.text.split()[0], msg.text.split()[1]) in DECK)
 async def round_play(message: types.Message):
-    result = get_partner(message)
+    result = partners_db.select_by_id(message.chat.id)
     partner_chat_id = result.fetchone()[1]
     durak = durak_games[str(message.chat.id)]
-    print(durak, 'object')
     if durak.attacker_chat_id == message.chat.id:
         if durak.attack((message.text.split()[0], message.text.split()[1])):
-            await message.answer('Accepted!', reply_markup=get_card_hand_kb(durak.current_player.cards,
-                                                                            durak.current_player.index,
-                                                                            durak.attacker_index))
+            await message.answer('Принято!', reply_markup=durak_interface.get_card_hand_kb(durak.current_player.cards,
+                                                                           durak.current_player.index,
+                                                                           durak.attacker_index))
             if durak.is_no_cards():
-                await attacker_finish(message)
+                await attacker_finish(message, True)
             await bot.send_message(partner_chat_id, message.text)
         else:
-            await message.answer('You cannot play this card right now!')
+            await message.answer('Ты не можешь играть этой картой сейчас!')
     else:
         is_defended = False
         for card in durak.attacking_cards:
             if durak.defend(card, (message.text.split()[0], message.text.split()[1])):
-                await message.answer('Accepted!', reply_markup=get_card_hand_kb(durak.opponent_player.cards,
-                                                                                durak.opponent_player.index,
-                                                                                durak.attacker_index))
+                await message.answer('Принято!',
+                                     reply_markup=durak_interface.get_card_hand_kb(durak.opponent_player.cards,
+                                                                                   durak.opponent_player.index,
+                                                                                   durak.attacker_index))
                 is_defended = True
                 if durak.is_no_cards():
                     await defender_finish(message)
                 await bot.send_message(partner_chat_id, message.text)
                 break
         if not is_defended:
-            await message.answer('You cannot play this card right now!')
-        # await create_or_edit_field(messages[message.chat.id])
-    # except Exception:
-    # await message.answer("You don't have any partners yet. Send me /play and I'll find you somebody to play with:)")
+            await message.answer('Ты не можешь играть этой картой сейчас!')
+    await durak_interface.create_or_edit_field(durak, message=durak_interface.messages[str(message.chat.id)])
+    await durak_interface.create_or_edit_field(durak, message=durak_interface.messages[str(partner_chat_id)])
 
 
 @dp.message_handler()
 async def dialog(message: types.Message):
     try:
-        result = get_partner(message)
+        result = partners_db.select_by_id(message.chat.id)
         partner_chat_id = result.fetchone()[1]
         await bot.send_message(partner_chat_id, message.text)
     except Exception:
-        await message.answer("You don't have any partners yet. Send me /play and I'll find you somebody to play with:)")
+        await message.answer("У тебя нету партнеров пока что. Отправь мне /play и я найду с кем тебе поиграть:)")
 
 executor.start_polling(dispatcher=dp, skip_updates=True)
